@@ -1,0 +1,1446 @@
+---
+title: "Results"
+output: html_document
+---
+
+## Selecting the index.
+
+The first step is select the index of interest. We have two dataframe, the *index.csv* has the index closing price and *indexRV.csv* has the range (Maximum minus Minimum) of the daily closing price.
+
+```{r, echo=FALSE, message=FALSE, warning=FALSE}
+library(DEoptim)
+library(ggplot2)
+library(tseries)
+library(knitr)
+#Read data
+index<- read.csv2("Data/index.csv")
+index<-index[,-2]
+indexRV<- read.csv2("Data/indexRV.csv")
+#Convert to date
+index$Day<-as.Date(index$Day, "%d/%m/%Y")
+indexRV$Day<-as.Date(indexRV$Day, "%d/%m/%Y")
+#Convert factor to numeric
+index[,2:ncol(index)]<-apply(index[,2:ncol(index)],2,function(x)as.numeric(as.character(x)))
+indexRV[,2:ncol(indexRV)]<-apply(indexRV[,2:ncol(indexRV)],2,function(x)as.numeric(as.character(x)))
+#Sort data
+index <- index[order(index[,1]),]
+indexRV <- indexRV[order(indexRV[,1]),]
+#Create results dataframe
+hits.train<-data.frame("Model"=NA,"Mean.Hits"=NA,"Var.Hits"=NA)
+hits.valid<-data.frame("Model"=NA,"Mean.Hits"=NA,"Var.Hits"=NA)
+
+```
+
+The tickets avalibe are `r colnames(index[,2:ncol(index)])`.
+
+Then we need to choose the first ticket to work, for example:
+
+```{r}
+#Column number
+column <- 1
+#Select the ticket
+data.tmp<- as.data.frame(index[,column+1])
+dataRV.tmp<- as.data.frame(indexRV[,column+1])
+#Create the rownames
+rownames(data.tmp)<-index[,1]
+rownames(dataRV.tmp)<-indexRV[,1]
+```
+
+We need to reomve all *NA* values (this is know as listwise method):
+
+```{r}
+#Remove NA
+data.tmp<-  na.omit(data.tmp)
+#Calculate the return
+data.tmp[,1]<-c(NA,diff(log(data.tmp[,1])))
+dataRV.tmp<-na.omit(dataRV.tmp)
+dataRV.tmp[,1]<-c(NA,diff(log(dataRV.tmp[,1])))
+#Remove the first period NA
+data.tmp<-as.data.frame(data.tmp[-1,])
+colnames(data.tmp)<-colnames(index)[column+1]
+dataRV.tmp<-as.data.frame(dataRV.tmp[-1,])
+colnames(dataRV.tmp)<-colnames(indexRV)[column+1]
+```
+
+Now we will split the data into *training* (70%) and *validation* (30%) dataframe:
+
+```{r}
+seq1<-ceiling(nrow(data.tmp)*0.7)
+#Training
+train<- data.tmp[1:seq1,1]
+trainRV<- dataRV.tmp[1:seq1,1]
+#Validation
+valid<- data.tmp[(seq1+1):nrow(data.tmp),1]
+validRV<- dataRV.tmp[(seq1+1):nrow(data.tmp),1]
+```
+
+##Optimizing the model.
+Given the vector of closing prices we can estimate the models:
+
+```{r}
+#Call all the model's function:
+source("Models.R")
+#Define tau
+tau<- 0.05
+#Create the CAViaR vector
+var<-as.numeric(quantile(train, probs = tau))
+CAViaR<-rep(var,length(train))
+```
+
+###Adaptive Model.
+We can start using the Adaptive Model:
+
+```{r,message=FALSE, warning=FALSE}
+#Number of parameters
+nparms<- 1
+#The Adaptive Model has 2 parameters and we need to specify G:
+G<- 1
+res <- DEoptim(Adaptive,lower=rep(-10,nparms),
+               upper=rep(+10,nparms),control=list(trace=FALSE))
+betas <- res$optim$bestmem
+```
+
+Now we can do the forecast:
+
+```{r,message=FALSE, warning=FALSE}
+#CAViaR train
+CAViaR.train<-AdaptiveForecast(betas=betas,data=train)
+CAViaR.train[is.infinite(CAViaR.train)| which(CAViaR.train< -(1e+10))]<- -1
+#CAViaR valid
+CAViaR.valid<-AdaptiveForecast(betas=betas,data=valid)
+CAViaR.valid[is.infinite(CAViaR.valid)|which(CAViaR.valid< -(1e+10))]<- -1
+```
+
+We can visualize the CAViaR prediction for the training :
+
+```{r}
+#Create the dataPlot
+dataPlot<-as.data.frame(cbind(train,CAViaR.train))
+dataPlot$Date<-index[1:seq1,1]
+colnames(dataPlot)<-c(colnames(data.tmp),'CAViaR','Date')
+#Plot the time series
+ggplot(dataPlot, aes(Date)) + 
+  geom_line(aes(y = dataPlot[,colnames(data.tmp)] , colour = colnames(data.tmp)),size=0.1) + 
+  geom_line(aes(y = CAViaR, colour = "CAViaR"), size=0.3) +
+  labs(x = "Date.",y="Log-return.")+
+  labs(color='Time Series') + scale_color_manual(values=c("gray20", "gray70")) + theme_bw()
+ggsave("AdaptiveTraining.pdf")
+```
+We can visualize the CAViaR prediction for the validation :
+
+```{r}
+#Create the dataPlot
+dataPlot<-as.data.frame(cbind(valid,CAViaR.valid))
+dataPlot$Date<-index[(seq1+1):nrow(data.tmp),1]
+colnames(dataPlot)<-c(colnames(data.tmp),'CAViaR','Date')
+#Plot the time series
+ggplot(dataPlot, aes(Date)) + 
+  geom_line(aes(y = dataPlot[,colnames(data.tmp)] , colour = colnames(data.tmp)),size=0.1) + 
+  geom_line(aes(y = CAViaR, colour = "CAViaR"), size=0.3) +
+    labs(x = "Date.",y="Log-return.")+
+  labs(color='Time Series') + scale_color_manual(values=c("gray20", "gray70")) + theme_bw()
+ggsave("AdaptiveValidation.pdf")
+```
+
+The next step is peform the goodness-of-fit of the proposed model. We start calculating the number of HITS for each time series, i.e., for the training dataframe we have `r mean(train < CAViaR.train)` and for the validation dataframe we have `r mean(valid < CAViaR.valid)`.
+
+Since those are estimates we need a measure of variability for those HITS. We can use the stationary bootstrap to calculate the Mean Squared Error (MSE) for those estimates. We begin with the bootstrap resample for the training dataset:
+
+```{r}
+#Set seed
+set.seed(5584)
+B <- 5000
+serieBoot<-tsbootstrap(train, nb = B, type = "stationary") 
+
+#Calculate the HITS for each time series
+hits<-data.frame("VaR"=rep(NA,B))
+for(b in 1:B){
+    #Bootstrap CAViaR
+    CAViaR_boot <- AdaptiveForecast(betas=betas,data=serieBoot[,b])
+    #Hits
+    hits[b,"VaR"] <- mean(serieBoot[, b] < CAViaR_boot)
+}
+hits.train[1,"Model"]<-"Adaptive"
+hits.train[1,"Mean.Hits"]<- mean(hits[,"VaR"],na.rm = T)
+hits.train[1,"Var.Hits"] <- var(hits[,"VaR"],na.rm = T)
+```
+
+We can do the same for the validation dataframe:
+
+```{r}
+#Set seed
+set.seed(1547)
+B <- 5000
+serieBoot<-tsbootstrap(valid, nb = B, type = "stationary") 
+
+#Calculate the HITS for each time series
+hits<-data.frame("VaR"=rep(NA,B))
+for(b in 1:B){
+    #Bootstrap CAViaR
+    CAViaR_boot <- AdaptiveForecast(betas=betas,data=serieBoot[,b])
+    #Hits
+    hits[b,"VaR"] <- mean(serieBoot[, b] < CAViaR_boot)
+}
+hits.valid[1,"Model"]<-"Adaptive"
+hits.valid[1,"Mean.Hits"]<- mean(hits[,"VaR"],na.rm = T)
+hits.valid[1,"Var.Hits"] <- var(hits[,"VaR"],na.rm = T)
+```
+
+
+###Symmetric Absolute Model.
+We can start using the Symmetric Absolute Model:
+
+```{r,message=FALSE, warning=FALSE}
+#Number of parameters
+nparms<- 3
+res <- DEoptim(SymmetricAbs,lower=rep(-10,nparms),
+               upper=rep(+10,nparms),control=list(trace=FALSE))
+betas <- res$optim$bestmem
+```
+
+Now we can do the forecast:
+
+```{r,message=FALSE, warning=FALSE}
+#CAViaR train
+CAViaR.train<-SymmetricAbsForecast(betas=betas,data=train)
+CAViaR.train[is.infinite(CAViaR.train)| which(CAViaR.train< -(1e+10))]<- -1
+#CAViaR valid
+CAViaR.valid<-SymmetricAbsForecast(betas=betas,data=valid)
+CAViaR.valid[is.infinite(CAViaR.valid)|which(CAViaR.valid< -(1e+10))]<- -1
+```
+
+We can visualize the CAViaR prediction for the training :
+
+```{r}
+#Create the dataPlot
+dataPlot<-as.data.frame(cbind(train,CAViaR.train))
+dataPlot$Date<-index[1:seq1,1]
+colnames(dataPlot)<-c(colnames(data.tmp),'CAViaR','Date')
+#Plot the time series
+ggplot(dataPlot, aes(Date)) + 
+  geom_line(aes(y = dataPlot[,colnames(data.tmp)] , colour = colnames(data.tmp)),size=0.1) + 
+  geom_line(aes(y = CAViaR, colour = "CAViaR"), size=0.3) +
+  labs(x = "Date.",y="Log-return.")+
+  labs(color='Time Series') + scale_color_manual(values=c("gray20", "gray70")) + theme_bw()
+ggsave("symmetricAbsTraining.pdf")
+```
+We can visualize the CAViaR prediction for the validation :
+
+```{r}
+#Create the dataPlot
+dataPlot<-as.data.frame(cbind(valid,CAViaR.valid))
+dataPlot$Date<-index[(seq1+1):nrow(data.tmp),1]
+colnames(dataPlot)<-c(colnames(data.tmp),'CAViaR','Date')
+#Plot the time series
+ggplot(dataPlot, aes(Date)) + 
+  geom_line(aes(y = dataPlot[,colnames(data.tmp)] , colour = colnames(data.tmp)),size=0.1) + 
+  geom_line(aes(y = CAViaR, colour = "CAViaR"), size=0.3) +
+    labs(x = "Date.",y="Log-return.")+
+  labs(color='Time Series') + scale_color_manual(values=c("gray20", "gray70")) + theme_bw()
+ggsave("symmetricAbsValidation.pdf")
+```
+
+The next step is peform the goodness-of-fit of the proposed model. We start calculating the number of HITS for each time series, i.e., for the training dataframe we have `r mean(train < CAViaR.train)` and for the validation dataframe we have `r mean(valid < CAViaR.valid)`.
+
+Since those are estimates we need a measure of variability for those HITS. We can use the stationary bootstrap to calculate the Mean Squared Error (MSE) for those estimates. We begin with the bootstrap resample for the training dataset:
+
+```{r}
+#Set seed
+set.seed(8795)
+B <- 5000
+serieBoot<-tsbootstrap(train, nb = B, type = "stationary") 
+
+#Calculate the HITS for each time series
+hits<-data.frame("VaR"=rep(NA,B))
+for(b in 1:B){
+    #Bootstrap CAViaR
+    CAViaR_boot <- SymmetricAbsForecast(betas=betas,data=serieBoot[,b])
+    #Hits
+    hits[b,"VaR"] <- mean(serieBoot[, b] < CAViaR_boot)
+}
+hits.temp<-data.frame("Model"="symmetricAbs","Mean.Hits"=mean(hits[,"VaR"],na.rm = T),"Var.Hits"=var(hits[,"VaR"],na.rm = T))
+hits.train<-rbind(hits.train,hits.temp)
+```
+
+We can do the same for the validation dataframe:
+
+```{r}
+#Set seed
+set.seed(9627)
+B <- 5000
+serieBoot<-tsbootstrap(valid, nb = B, type = "stationary") 
+
+#Calculate the HITS for each time series
+hits<-data.frame("VaR"=rep(NA,B))
+for(b in 1:B){
+    #Bootstrap CAViaR
+    CAViaR_boot <- SymmetricAbsForecast(betas=betas,data=serieBoot[,b])
+    #Hits
+    hits[b,"VaR"] <- mean(serieBoot[, b] < CAViaR_boot)
+}
+hits.temp<-data.frame("Model"="symmetricAbs","Mean.Hits"=mean(hits[,"VaR"],na.rm = T),"Var.Hits"=var(hits[,"VaR"],na.rm = T))
+hits.valid<-rbind(hits.valid,hits.temp)
+```
+
+
+###IndirectGARCH Model.
+We can start using the IndirectGARCH Model:
+
+```{r,message=FALSE, warning=FALSE}
+#Number of parameters
+nparms<- 3
+res <- DEoptim(IndirectGARCH,lower=rep(-10,nparms),
+               upper=rep(10,nparms),control=list(strategy = 2,trace=FALSE, 
+                                                  NP=50, itermax=50, CR=0.9,
+                                                  F=0.8))
+betas <- res$optim$bestmem
+```
+
+Now we can do the forecast:
+
+```{r,message=FALSE, warning=FALSE}
+#CAViaR train
+CAViaR.train<-IndirectGARCHForecast(betas=betas,data=train)
+CAViaR.train[is.infinite(CAViaR.train)| which(CAViaR.train< -(1e+10))]<- -1
+#CAViaR valid
+CAViaR.valid<-IndirectGARCHForecast(betas=betas,data=valid)
+CAViaR.valid[is.infinite(CAViaR.valid)|which(CAViaR.valid< -(1e+10))]<- -1
+```
+
+We can visualize the CAViaR prediction for the training :
+
+```{r}
+#Create the dataPlot
+dataPlot<-as.data.frame(cbind(train,CAViaR.train))
+dataPlot$Date<-index[1:seq1,1]
+colnames(dataPlot)<-c(colnames(data.tmp),'CAViaR','Date')
+#Plot the time series
+ggplot(dataPlot, aes(Date)) + 
+  geom_line(aes(y = dataPlot[,colnames(data.tmp)] , colour = colnames(data.tmp)),size=0.1) + 
+  geom_line(aes(y = CAViaR, colour = "CAViaR"), size=0.3) +
+  labs(x = "Date.",y="Log-return.")+
+  labs(color='Time Series') + scale_color_manual(values=c("gray20", "gray70")) + theme_bw()
+ggsave("IndirectGARCHTraining.pdf")
+```
+We can visualize the CAViaR prediction for the validation :
+
+```{r}
+#Create the dataPlot
+dataPlot<-as.data.frame(cbind(valid,CAViaR.valid))
+dataPlot$Date<-index[(seq1+1):nrow(data.tmp),1]
+colnames(dataPlot)<-c(colnames(data.tmp),'CAViaR','Date')
+#Plot the time series
+ggplot(dataPlot, aes(Date)) + 
+  geom_line(aes(y = dataPlot[,colnames(data.tmp)] , colour = colnames(data.tmp)),size=0.1) + 
+  geom_line(aes(y = CAViaR, colour = "CAViaR"), size=0.3) +
+    labs(x = "Date.",y="Log-return.")+
+  labs(color='Time Series') + scale_color_manual(values=c("gray20", "gray70")) + theme_bw()
+ggsave("IndirectGARCHValidation.pdf")
+```
+
+The next step is peform the goodness-of-fit of the proposed model. We start calculating the number of HITS for each time series, i.e., for the training dataframe we have `r mean(train < CAViaR.train)` and for the validation dataframe we have `r mean(valid < CAViaR.valid)`.
+
+Since those are estimates we need a measure of variability for those HITS. We can use the stationary bootstrap to calculate the Mean Squared Error (MSE) for those estimates. We begin with the bootstrap resample for the training dataset:
+
+```{r}
+#Set seed
+set.seed(8795)
+B <- 5000
+serieBoot<-tsbootstrap(train, nb = B, type = "stationary") 
+
+#Calculate the HITS for each time series
+hits<-data.frame("VaR"=rep(NA,B))
+for(b in 1:B){
+    #Bootstrap CAViaR
+    CAViaR_boot <- IndirectGARCHForecast(betas=betas,data=serieBoot[,b])
+    #Hits
+    hits[b,"VaR"] <- mean(serieBoot[, b] < CAViaR_boot)
+}
+hits.temp<-data.frame("Model"="IndirectGARCH","Mean.Hits"=mean(hits[,"VaR"],na.rm = T),"Var.Hits"=var(hits[,"VaR"],na.rm = T))
+hits.train<-rbind(hits.train,hits.temp)
+```
+
+We can do the same for the validation dataframe:
+
+```{r}
+#Set seed
+set.seed(9627)
+B <- 5000
+serieBoot<-tsbootstrap(valid, nb = B, type = "stationary") 
+
+#Calculate the HITS for each time series
+hits<-data.frame("VaR"=rep(NA,B))
+for(b in 1:B){
+    #Bootstrap CAViaR
+    CAViaR_boot <- IndirectGARCHForecast(betas=betas,data=serieBoot[,b])
+    #Hits
+    hits[b,"VaR"] <- mean(serieBoot[, b] < CAViaR_boot)
+}
+hits.temp<-data.frame("Model"="IndirectGARCH","Mean.Hits"=mean(hits[,"VaR"],na.rm = T),"Var.Hits"=var(hits[,"VaR"],na.rm = T))
+hits.valid<-rbind(hits.valid,hits.temp)
+```
+
+
+###Indirect GARCH with mu Model.
+We can start using the standardGARCHmu Model:
+
+```{r,message=FALSE, warning=FALSE}
+#Number of parameters
+nparms<- 4
+res <- DEoptim(IndirectGARCHmu,lower=rep(-10,nparms),
+               upper=rep(+10,nparms),control=list(trace=FALSE))
+betas <- res$optim$bestmem
+```
+
+Now we can do the forecast:
+
+```{r,message=FALSE, warning=FALSE}
+#CAViaR train
+CAViaR.train<-IndirectGARCHmuForecast(betas=betas,data=train)
+CAViaR.valid[is.infinite(CAViaR.valid)|which(CAViaR.valid< -(1e+10))]<- -1
+#CAViaR valid
+CAViaR.valid<-IndirectGARCHmuForecast(betas=betas,data=valid)
+CAViaR.valid[is.infinite(CAViaR.valid)|which(CAViaR.valid< -(1e+10))]<- -1
+```
+
+We can visualize the CAViaR prediction for the training :
+
+```{r}
+#Create the dataPlot
+dataPlot<-as.data.frame(cbind(train,CAViaR.train))
+dataPlot$Date<-index[1:seq1,1]
+colnames(dataPlot)<-c(colnames(data.tmp),'CAViaR','Date')
+#Plot the time series
+ggplot(dataPlot, aes(Date)) + 
+  geom_line(aes(y = dataPlot[,colnames(data.tmp)] , colour = colnames(data.tmp)),size=0.1) + 
+  geom_line(aes(y = CAViaR, colour = "CAViaR"), size=0.3) +
+  labs(x = "Date.",y="Log-return.")+
+  labs(color='Time Series') + scale_color_manual(values=c("gray20", "gray70")) + theme_bw()
+ggsave("standardGARCHmuTraining.pdf")
+```
+We can visualize the CAViaR prediction for the validation :
+
+```{r}
+#Create the dataPlot
+dataPlot<-as.data.frame(cbind(valid,CAViaR.valid))
+dataPlot$Date<-index[(seq1+1):nrow(data.tmp),1]
+colnames(dataPlot)<-c(colnames(data.tmp),'CAViaR','Date')
+#Plot the time series
+ggplot(dataPlot, aes(Date)) + 
+  geom_line(aes(y = dataPlot[,colnames(data.tmp)] , colour = colnames(data.tmp)),size=0.1) + 
+  geom_line(aes(y = CAViaR, colour = "CAViaR"), size=0.3) +
+    labs(x = "Date.",y="Log-return.")+
+  labs(color='Time Series') + scale_color_manual(values=c("gray20", "gray70")) + theme_bw()
+ggsave("standardGARCHmuValidation.pdf")
+```
+
+The next step is peform the goodness-of-fit of the proposed model. We start calculating the number of HITS for each time series, i.e., for the training dataframe we have `r mean(train < CAViaR.train)` and for the validation dataframe we have `r mean(valid < CAViaR.valid)`.
+
+Since those are estimates we need a measure of variability for those HITS. We can use the stationary bootstrap to calculate the Mean Squared Error (MSE) for those estimates. We begin with the bootstrap resample for the training dataset:
+
+```{r}
+#Set seed
+set.seed(8795)
+B <- 5000
+serieBoot<-tsbootstrap(train, nb = B, type = "stationary") 
+
+#Calculate the HITS for each time series
+hits<-data.frame("VaR"=rep(NA,B))
+for(b in 1:B){
+    #Bootstrap CAViaR
+    CAViaR_boot <- IndirectGARCHmuForecast(betas=betas,data=serieBoot[,b])
+    #Hits
+    hits[b,"VaR"] <- mean(serieBoot[, b] < CAViaR_boot)
+}
+hits.temp<-data.frame("Model"="standardGARCHmu","Mean.Hits"=mean(hits[,"VaR"],na.rm = T),"Var.Hits"=var(hits[,"VaR"],na.rm = T))
+hits.train<-rbind(hits.train,hits.temp)
+```
+
+We can do the same for the validation dataframe:
+
+```{r}
+#Set seed
+set.seed(9627)
+B <- 5000
+serieBoot<-tsbootstrap(valid, nb = B, type = "stationary") 
+
+#Calculate the HITS for each time series
+hits<-data.frame("VaR"=rep(NA,B))
+for(b in 1:B){
+    #Bootstrap CAViaR
+    CAViaR_boot <- IndirectGARCHmuForecast(betas=betas,data=serieBoot[,b])
+    #Hits
+    hits[b,"VaR"] <- mean(serieBoot[, b] < CAViaR_boot)
+}
+hits.temp<-data.frame("Model"="standardGARCHmu","Mean.Hits"=mean(hits[,"VaR"],na.rm = T),"Var.Hits"=var(hits[,"VaR"],na.rm = T))
+hits.valid<-rbind(hits.valid,hits.temp)
+```
+
+###linearGARCH Model.
+We can start using the linearGARCH Model:
+
+```{r,message=FALSE, warning=FALSE}
+#Number of parameters
+nparms<- 3
+res <- DEoptim(linearGARCH,lower=rep(-10,nparms),
+               upper=rep(+10,nparms),control=list(trace=FALSE))
+betas <- res$optim$bestmem
+```
+
+Now we can do the forecast:
+
+```{r,message=FALSE, warning=FALSE}
+#CAViaR train
+CAViaR.train<-linearGARCHForecast(betas=betas,data=train)
+CAViaR.train[is.infinite(CAViaR.train)| which(CAViaR.train< -(1e+10))]<- -1
+#CAViaR valid
+CAViaR.valid<-linearGARCHForecast(betas=betas,data=valid)
+CAViaR.valid[is.infinite(CAViaR.valid)|which(CAViaR.valid< -(1e+10))]<- -1
+```
+
+We can visualize the CAViaR prediction for the training :
+
+```{r}
+#Create the dataPlot
+dataPlot<-as.data.frame(cbind(train,CAViaR.train))
+dataPlot$Date<-index[1:seq1,1]
+colnames(dataPlot)<-c(colnames(data.tmp),'CAViaR','Date')
+#Plot the time series
+ggplot(dataPlot, aes(Date)) + 
+  geom_line(aes(y = dataPlot[,colnames(data.tmp)] , colour = colnames(data.tmp)),size=0.1) + 
+  geom_line(aes(y = CAViaR, colour = "CAViaR"), size=0.3) +
+  labs(x = "Date.",y="Log-return.")+
+  labs(color='Time Series') + scale_color_manual(values=c("gray20", "gray70")) + theme_bw()
+ggsave("linearGARCHTraining.pdf")
+```
+We can visualize the CAViaR prediction for the validation :
+
+```{r}
+#Create the dataPlot
+dataPlot<-as.data.frame(cbind(valid,CAViaR.valid))
+dataPlot$Date<-index[(seq1+1):nrow(data.tmp),1]
+colnames(dataPlot)<-c(colnames(data.tmp),'CAViaR','Date')
+#Plot the time series
+ggplot(dataPlot, aes(Date)) + 
+  geom_line(aes(y = dataPlot[,colnames(data.tmp)] , colour = colnames(data.tmp)),size=0.1) + 
+  geom_line(aes(y = CAViaR, colour = "CAViaR"), size=0.3) +
+    labs(x = "Date.",y="Log-return.")+
+  labs(color='Time Series') + scale_color_manual(values=c("gray20", "gray70")) + theme_bw()
+ggsave("linearGARCHValidation.pdf")
+```
+
+The next step is peform the goodness-of-fit of the proposed model. We start calculating the number of HITS for each time series, i.e., for the training dataframe we have `r mean(train < CAViaR.train)` and for the validation dataframe we have `r mean(valid < CAViaR.valid)`.
+
+Since those are estimates we need a measure of variability for those HITS. We can use the stationary bootstrap to calculate the Mean Squared Error (MSE) for those estimates. We begin with the bootstrap resample for the training dataset:
+
+```{r}
+#Set seed
+set.seed(8795)
+B <- 5000
+serieBoot<-tsbootstrap(train, nb = B, type = "stationary") 
+
+#Calculate the HITS for each time series
+hits<-data.frame("VaR"=rep(NA,B))
+for(b in 1:B){
+    #Bootstrap CAViaR
+    CAViaR_boot <- linearGARCHForecast(betas=betas,data=serieBoot[,b])
+    #Hits
+    hits[b,"VaR"] <- mean(serieBoot[, b] < CAViaR_boot)
+}
+hits.temp<-data.frame("Model"="linearGARCH","Mean.Hits"=mean(hits[,"VaR"],na.rm = T),"Var.Hits"=var(hits[,"VaR"],na.rm = T))
+hits.train<-rbind(hits.train,hits.temp)
+```
+
+We can do the same for the validation dataframe:
+
+```{r}
+#Set seed
+set.seed(9627)
+B <- 5000
+serieBoot<-tsbootstrap(valid, nb = B, type = "stationary") 
+
+#Calculate the HITS for each time series
+hits<-data.frame("VaR"=rep(NA,B))
+for(b in 1:B){
+    #Bootstrap CAViaR
+    CAViaR_boot <- linearGARCHForecast(betas=betas,data=serieBoot[,b])
+    #Hits
+    hits[b,"VaR"] <- mean(serieBoot[, b] < CAViaR_boot)
+}
+hits.temp<-data.frame("Model"="linearGARCH","Mean.Hits"=mean(hits[,"VaR"],na.rm = T),"Var.Hits"=var(hits[,"VaR"],na.rm = T))
+hits.valid<-rbind(hits.valid,hits.temp)
+```
+
+###linearGARCHmu Model.
+We can start using the linearGARCHmu Model:
+
+```{r,message=FALSE, warning=FALSE}
+#Number of parameters
+nparms<- 4
+res <- DEoptim(linearGARCHmu,lower=rep(-10,nparms),
+               upper=rep(+10,nparms),control=list(trace=FALSE))
+betas <- res$optim$bestmem
+```
+
+Now we can do the forecast:
+
+```{r,message=FALSE, warning=FALSE}
+#CAViaR train
+CAViaR.train<-linearGARCHmuForecast(betas=betas,data=train)
+CAViaR.train[is.infinite(CAViaR.train)| which(CAViaR.train< -(1e+10))]<- -1
+#CAViaR valid
+CAViaR.valid<-linearGARCHmuForecast(betas=betas,data=valid)
+CAViaR.valid[is.infinite(CAViaR.valid)|which(CAViaR.valid< -(1e+10))]<- -1
+```
+
+We can visualize the CAViaR prediction for the training :
+
+```{r}
+#Create the dataPlot
+dataPlot<-as.data.frame(cbind(train,CAViaR.train))
+dataPlot$Date<-index[1:seq1,1]
+colnames(dataPlot)<-c(colnames(data.tmp),'CAViaR','Date')
+#Plot the time series
+ggplot(dataPlot, aes(Date)) + 
+  geom_line(aes(y = dataPlot[,colnames(data.tmp)] , colour = colnames(data.tmp)),size=0.1) + 
+  geom_line(aes(y = CAViaR, colour = "CAViaR"), size=0.3) +
+  labs(x = "Date.",y="Log-return.")+
+  labs(color='Time Series') + scale_color_manual(values=c("gray20", "gray70")) + theme_bw()
+ggsave("linearGARCHmuTraining.pdf")
+```
+We can visualize the CAViaR prediction for the validation :
+
+```{r}
+#Create the dataPlot
+dataPlot<-as.data.frame(cbind(valid,CAViaR.valid))
+dataPlot$Date<-index[(seq1+1):nrow(data.tmp),1]
+colnames(dataPlot)<-c(colnames(data.tmp),'CAViaR','Date')
+#Plot the time series
+ggplot(dataPlot, aes(Date)) + 
+  geom_line(aes(y = dataPlot[,colnames(data.tmp)] , colour = colnames(data.tmp)),size=0.1) + 
+  geom_line(aes(y = CAViaR, colour = "CAViaR"), size=0.3) +
+    labs(x = "Date.",y="Log-return.")+
+  labs(color='Time Series') + scale_color_manual(values=c("gray20", "gray70")) + theme_bw()
+ggsave("linearGARCHmuValidation.pdf")
+```
+
+The next step is peform the goodness-of-fit of the proposed model. We start calculating the number of HITS for each time series, i.e., for the training dataframe we have `r mean(train < CAViaR.train)` and for the validation dataframe we have `r mean(valid < CAViaR.valid)`.
+
+Since those are estimates we need a measure of variability for those HITS. We can use the stationary bootstrap to calculate the Mean Squared Error (MSE) for those estimates. We begin with the bootstrap resample for the training dataset:
+
+```{r}
+#Set seed
+set.seed(8795)
+B <- 5000
+serieBoot<-tsbootstrap(train, nb = B, type = "stationary") 
+
+#Calculate the HITS for each time series
+hits<-data.frame("VaR"=rep(NA,B))
+for(b in 1:B){
+    #Bootstrap CAViaR
+    CAViaR_boot <- linearGARCHmuForecast(betas=betas,data=serieBoot[,b])
+    #Hits
+    hits[b,"VaR"] <- mean(serieBoot[, b] < CAViaR_boot)
+}
+hits.temp<-data.frame("Model"="linearGARCHmu","Mean.Hits"=mean(hits[,"VaR"],na.rm = T),"Var.Hits"=var(hits[,"VaR"],na.rm = T))
+hits.train<-rbind(hits.train,hits.temp)
+```
+
+We can do the same for the validation dataframe:
+
+```{r}
+#Set seed
+set.seed(9627)
+B <- 5000
+serieBoot<-tsbootstrap(valid, nb = B, type = "stationary") 
+
+#Calculate the HITS for each time series
+hits<-data.frame("VaR"=rep(NA,B))
+for(b in 1:B){
+    #Bootstrap CAViaR
+    CAViaR_boot <- linearGARCHmuForecast(betas=betas,data=serieBoot[,b])
+    #Hits
+    hits[b,"VaR"] <- mean(serieBoot[, b] < CAViaR_boot)
+}
+hits.temp<-data.frame("Model"="linearGARCHmu","Mean.Hits"=mean(hits[,"VaR"],na.rm = T),"Var.Hits"=var(hits[,"VaR"],na.rm = T))
+hits.valid<-rbind(hits.valid,hits.temp)
+```
+
+###GJRGARCH Model.
+We can start using the GJRGARCH Model:
+
+```{r,message=FALSE, warning=FALSE}
+#Number of parameters
+nparms<- 4
+res <- DEoptim(GJRGARCH,lower=rep(-10,nparms),
+               upper=rep(+10,nparms),control=list(strategy = 2,trace=FALSE, 
+                                                  NP=50, itermax=200, CR=0.9))
+betas <- res$optim$bestmem
+```
+
+Now we can do the forecast:
+
+```{r,message=FALSE, warning=FALSE}
+#CAViaR train
+CAViaR.train<-GJRGARCHForecast(betas=betas,data=train)
+CAViaR.train[is.infinite(CAViaR.train)| which(CAViaR.train< -(1e+10))]<- -1
+#CAViaR valid
+CAViaR.valid<-GJRGARCHForecast(betas=betas,data=valid)
+CAViaR.valid[is.infinite(CAViaR.valid)|which(CAViaR.valid< -(1e+10))]<- -1
+```
+
+We can visualize the CAViaR prediction for the training :
+
+```{r}
+#Create the dataPlot
+dataPlot<-as.data.frame(cbind(train,CAViaR.train))
+dataPlot$Date<-index[1:seq1,1]
+colnames(dataPlot)<-c(colnames(data.tmp),'CAViaR','Date')
+#Plot the time series
+ggplot(dataPlot, aes(Date)) + 
+  geom_line(aes(y = dataPlot[,colnames(data.tmp)] , colour = colnames(data.tmp)),size=0.1) + 
+  geom_line(aes(y = CAViaR, colour = "CAViaR"), size=0.3) +
+  labs(x = "Date.",y="Log-return.")+
+  labs(color='Time Series') + scale_color_manual(values=c("gray20", "gray70")) + theme_bw()
+ggsave("GJRGARCHTraining.pdf")
+```
+We can visualize the CAViaR prediction for the validation :
+
+```{r}
+#Create the dataPlot
+dataPlot<-as.data.frame(cbind(valid,CAViaR.valid))
+dataPlot$Date<-index[(seq1+1):nrow(data.tmp),1]
+colnames(dataPlot)<-c(colnames(data.tmp),'CAViaR','Date')
+#Plot the time series
+ggplot(dataPlot, aes(Date)) + 
+  geom_line(aes(y = dataPlot[,colnames(data.tmp)] , colour = colnames(data.tmp)),size=0.1) + 
+  geom_line(aes(y = CAViaR, colour = "CAViaR"), size=0.3) +
+    labs(x = "Date.",y="Log-return.")+
+  labs(color='Time Series') + scale_color_manual(values=c("gray20", "gray70")) + theme_bw()
+ggsave("GJRGARCHValidation.pdf")
+```
+
+The next step is peform the goodness-of-fit of the proposed model. We start calculating the number of HITS for each time series, i.e., for the training dataframe we have `r mean(train < CAViaR.train)` and for the validation dataframe we have `r mean(valid < CAViaR.valid)`.
+
+Since those are estimates we need a measure of variability for those HITS. We can use the stationary bootstrap to calculate the Mean Squared Error (MSE) for those estimates. We begin with the bootstrap resample for the training dataset:
+
+```{r}
+#Set seed
+set.seed(8795)
+B <- 5000
+serieBoot<-tsbootstrap(train, nb = B, type = "stationary") 
+
+#Calculate the HITS for each time series
+hits<-data.frame("VaR"=rep(NA,B))
+for(b in 1:B){
+    #Bootstrap CAViaR
+    CAViaR_boot <- GJRGARCHForecast(betas=betas,data=serieBoot[,b])
+    #Hits
+    hits[b,"VaR"] <- mean(serieBoot[, b] < CAViaR_boot)
+}
+hits.temp<-data.frame("Model"="GJRGARCH","Mean.Hits"=mean(hits[,"VaR"],na.rm = T),"Var.Hits"=var(hits[,"VaR"],na.rm = T))
+hits.train<-rbind(hits.train,hits.temp)
+```
+
+We can do the same for the validation dataframe:
+
+```{r}
+#Set seed
+set.seed(9627)
+B <- 5000
+serieBoot<-tsbootstrap(valid, nb = B, type = "stationary") 
+
+#Calculate the HITS for each time series
+hits<-data.frame("VaR"=rep(NA,B))
+for(b in 1:B){
+    #Bootstrap CAViaR
+    CAViaR_boot <- GJRGARCHForecast(betas=betas,data=serieBoot[,b])
+    #Hits
+    hits[b,"VaR"] <- mean(serieBoot[, b] < CAViaR_boot)
+}
+hits.temp<-data.frame("Model"="GJRGARCH","Mean.Hits"=mean(hits[,"VaR"],na.rm = T),"Var.Hits"=var(hits[,"VaR"],na.rm = T))
+hits.valid<-rbind(hits.valid,hits.temp)
+```
+
+###GJRGARCHmu Model.
+We can start using the GJRGARCHmu Model:
+
+```{r,message=FALSE, warning=FALSE}
+#Number of parameters
+nparms<- 5
+res <- DEoptim(GJRGARCHmu,lower=rep(-10,nparms),
+               upper=rep(+10,nparms),control=list(trace=FALSE))
+betas <- res$optim$bestmem
+```
+
+Now we can do the forecast:
+
+```{r,message=FALSE, warning=FALSE}
+#CAViaR train
+CAViaR.train<-GJRGARCHmuForecast(betas=betas,data=train)
+CAViaR.train[is.infinite(CAViaR.train)| which(CAViaR.train< -(1e+10))]<- -1
+#CAViaR valid
+CAViaR.valid<-GJRGARCHmuForecast(betas=betas,data=valid)
+CAViaR.valid[is.infinite(CAViaR.valid)|which(CAViaR.valid< -(1e+10))]<- -1
+```
+
+We can visualize the CAViaR prediction for the training :
+
+```{r}
+#Create the dataPlot
+dataPlot<-as.data.frame(cbind(train,CAViaR.train))
+dataPlot$Date<-index[1:seq1,1]
+colnames(dataPlot)<-c(colnames(data.tmp),'CAViaR','Date')
+#Plot the time series
+ggplot(dataPlot, aes(Date)) + 
+  geom_line(aes(y = dataPlot[,colnames(data.tmp)] , colour = colnames(data.tmp)),size=0.1) + 
+  geom_line(aes(y = CAViaR, colour = "CAViaR"), size=0.3) +
+  labs(x = "Date.",y="Log-return.")+
+  labs(color='Time Series') + scale_color_manual(values=c("gray20", "gray70")) + theme_bw()
+ggsave("GJRGARCHmuTraining.pdf")
+```
+We can visualize the CAViaR prediction for the validation :
+
+```{r}
+#Create the dataPlot
+dataPlot<-as.data.frame(cbind(valid,CAViaR.valid))
+dataPlot$Date<-index[(seq1+1):nrow(data.tmp),1]
+colnames(dataPlot)<-c(colnames(data.tmp),'CAViaR','Date')
+#Plot the time series
+ggplot(dataPlot, aes(Date)) + 
+  geom_line(aes(y = dataPlot[,colnames(data.tmp)] , colour = colnames(data.tmp)),size=0.1) + 
+  geom_line(aes(y = CAViaR, colour = "CAViaR"), size=0.3) +
+    labs(x = "Date.",y="Log-return.")+
+  labs(color='Time Series') + scale_color_manual(values=c("gray20", "gray70")) + theme_bw()
+ggsave("GJRGARCHmuValidation.pdf")
+```
+
+The next step is peform the goodness-of-fit of the proposed model. We start calculating the number of HITS for each time series, i.e., for the training dataframe we have `r mean(train < CAViaR.train)` and for the validation dataframe we have `r mean(valid < CAViaR.valid)`.
+
+Since those are estimates we need a measure of variability for those HITS. We can use the stationary bootstrap to calculate the Mean Squared Error (MSE) for those estimates. We begin with the bootstrap resample for the training dataset:
+
+```{r}
+#Set seed
+set.seed(8795)
+B <- 5000
+serieBoot<-tsbootstrap(train, nb = B, type = "stationary") 
+
+#Calculate the HITS for each time series
+hits<-data.frame("VaR"=rep(NA,B))
+for(b in 1:B){
+    #Bootstrap CAViaR
+    CAViaR_boot <- GJRGARCHmuForecast(betas=betas,data=serieBoot[,b])
+    #Hits
+    hits[b,"VaR"] <- mean(serieBoot[, b] < CAViaR_boot)
+}
+hits.temp<-data.frame("Model"="GJRGARCHmu","Mean.Hits"=mean(hits[,"VaR"],na.rm = T),"Var.Hits"=var(hits[,"VaR"],na.rm = T))
+hits.train<-rbind(hits.train,hits.temp)
+```
+
+We can do the same for the validation dataframe:
+
+```{r}
+#Set seed
+set.seed(9627)
+B <- 5000
+serieBoot<-tsbootstrap(valid, nb = B, type = "stationary") 
+
+#Calculate the HITS for each time series
+hits<-data.frame("VaR"=rep(NA,B))
+for(b in 1:B){
+    #Bootstrap CAViaR
+    CAViaR_boot <- GJRGARCHmuForecast(betas=betas,data=serieBoot[,b])
+    #Hits
+    hits[b,"VaR"] <- mean(serieBoot[, b] < CAViaR_boot)
+}
+hits.temp<-data.frame("Model"="GJRGARCHmu","Mean.Hits"=mean(hits[,"VaR"],na.rm = T),"Var.Hits"=var(hits[,"VaR"],na.rm = T))
+hits.valid<-rbind(hits.valid,hits.temp)
+```
+
+###linearTGARCH Model.
+We can start using the linearTGARCH Model:
+
+```{r,message=FALSE, warning=FALSE}
+#Number of parameters
+nparms<- 4
+res <- DEoptim(linearTGARCH,lower=rep(-10,nparms),
+               upper=rep(+10,nparms),control=list(trace=FALSE))
+betas <- res$optim$bestmem
+```
+
+Now we can do the forecast:
+
+```{r,message=FALSE, warning=FALSE}
+#CAViaR train
+CAViaR.train<-linearTGARCHForecast(betas=betas,data=train)
+CAViaR.train[is.infinite(CAViaR.train)| which(CAViaR.train< -(1e+10))]<- -1
+#CAViaR valid
+CAViaR.valid<-linearTGARCHForecast(betas=betas,data=valid)
+CAViaR.valid[is.infinite(CAViaR.valid)|which(CAViaR.valid< -(1e+10))]<- -1
+```
+
+We can visualize the CAViaR prediction for the training :
+
+```{r}
+#Create the dataPlot
+dataPlot<-as.data.frame(cbind(train,CAViaR.train))
+dataPlot$Date<-index[1:seq1,1]
+colnames(dataPlot)<-c(colnames(data.tmp),'CAViaR','Date')
+#Plot the time series
+ggplot(dataPlot, aes(Date)) + 
+  geom_line(aes(y = dataPlot[,colnames(data.tmp)] , colour = colnames(data.tmp)),size=0.1) + 
+  geom_line(aes(y = CAViaR, colour = "CAViaR"), size=0.3) +
+  labs(x = "Date.",y="Log-return.")+
+  labs(color='Time Series') + scale_color_manual(values=c("gray20", "gray70")) + theme_bw()
+ggsave("linearTGARCHTraining.pdf")
+```
+We can visualize the CAViaR prediction for the validation :
+
+```{r}
+#Create the dataPlot
+dataPlot<-as.data.frame(cbind(valid,CAViaR.valid))
+dataPlot$Date<-index[(seq1+1):nrow(data.tmp),1]
+colnames(dataPlot)<-c(colnames(data.tmp),'CAViaR','Date')
+#Plot the time series
+ggplot(dataPlot, aes(Date)) + 
+  geom_line(aes(y = dataPlot[,colnames(data.tmp)] , colour = colnames(data.tmp)),size=0.1) + 
+  geom_line(aes(y = CAViaR, colour = "CAViaR"), size=0.3) +
+    labs(x = "Date.",y="Log-return.")+
+  labs(color='Time Series') + scale_color_manual(values=c("gray20", "gray70")) + theme_bw()
+ggsave("linearTGARCHValidation.pdf")
+```
+
+The next step is peform the goodness-of-fit of the proposed model. We start calculating the number of HITS for each time series, i.e., for the training dataframe we have `r mean(train < CAViaR.train)` and for the validation dataframe we have `r mean(valid < CAViaR.valid)`.
+
+Since those are estimates we need a measure of variability for those HITS. We can use the stationary bootstrap to calculate the Mean Squared Error (MSE) for those estimates. We begin with the bootstrap resample for the training dataset:
+
+```{r}
+#Set seed
+set.seed(8795)
+B <- 5000
+serieBoot<-tsbootstrap(train, nb = B, type = "stationary") 
+
+#Calculate the HITS for each time series
+hits<-data.frame("VaR"=rep(NA,B))
+for(b in 1:B){
+    #Bootstrap CAViaR
+    CAViaR_boot <- linearTGARCHForecast(betas=betas,data=serieBoot[,b])
+    #Hits
+    hits[b,"VaR"] <- mean(serieBoot[, b] < CAViaR_boot)
+}
+hits.temp<-data.frame("Model"="linearTGARCH","Mean.Hits"=mean(hits[,"VaR"],na.rm = T),"Var.Hits"=var(hits[,"VaR"],na.rm = T))
+hits.train<-rbind(hits.train,hits.temp)
+```
+
+We can do the same for the validation dataframe:
+
+```{r}
+#Set seed
+set.seed(9627)
+B <- 5000
+serieBoot<-tsbootstrap(valid, nb = B, type = "stationary") 
+
+#Calculate the HITS for each time series
+hits<-data.frame("VaR"=rep(NA,B))
+for(b in 1:B){
+    #Bootstrap CAViaR
+    CAViaR_boot <- linearTGARCHForecast(betas=betas,data=serieBoot[,b])
+    #Hits
+    hits[b,"VaR"] <- mean(serieBoot[, b] < CAViaR_boot)
+}
+hits.temp<-data.frame("Model"="linearTGARCH","Mean.Hits"=mean(hits[,"VaR"],na.rm = T),"Var.Hits"=var(hits[,"VaR"],na.rm = T))
+hits.valid<-rbind(hits.valid,hits.temp)
+```
+
+###linearTGARCHmu Model.
+We can start using the linearTGARCHmu Model:
+
+```{r,message=FALSE, warning=FALSE}
+#Number of parameters
+nparms<- 5
+res <- DEoptim(linearTGARCHmu,lower=rep(-10,nparms),
+               upper=rep(+10,nparms),control=list(trace=FALSE))
+betas <- res$optim$bestmem
+```
+
+Now we can do the forecast:
+
+```{r,message=FALSE, warning=FALSE}
+#CAViaR train
+CAViaR.train<-linearTGARCHmuForecast(betas=betas,data=train)
+CAViaR.train[is.infinite(CAViaR.train)| which(CAViaR.train< -(1e+10))]<- -1
+#CAViaR valid
+CAViaR.valid<-linearTGARCHmuForecast(betas=betas,data=valid)
+CAViaR.valid[is.infinite(CAViaR.valid)|which(CAViaR.valid< -(1e+10))]<- -1
+```
+
+We can visualize the CAViaR prediction for the training :
+
+```{r}
+#Create the dataPlot
+dataPlot<-as.data.frame(cbind(train,CAViaR.train))
+dataPlot$Date<-index[1:seq1,1]
+colnames(dataPlot)<-c(colnames(data.tmp),'CAViaR','Date')
+#Plot the time series
+ggplot(dataPlot, aes(Date)) + 
+  geom_line(aes(y = dataPlot[,colnames(data.tmp)] , colour = colnames(data.tmp)),size=0.1) + 
+  geom_line(aes(y = CAViaR, colour = "CAViaR"), size=0.3) +
+  labs(x = "Date.",y="Log-return.")+
+  labs(color='Time Series') + scale_color_manual(values=c("gray20", "gray70")) + theme_bw()
+ggsave("linearTGARCHmuTraining.pdf")
+```
+We can visualize the CAViaR prediction for the validation :
+
+```{r}
+#Create the dataPlot
+dataPlot<-as.data.frame(cbind(valid,CAViaR.valid))
+dataPlot$Date<-index[(seq1+1):nrow(data.tmp),1]
+colnames(dataPlot)<-c(colnames(data.tmp),'CAViaR','Date')
+#Plot the time series
+ggplot(dataPlot, aes(Date)) + 
+  geom_line(aes(y = dataPlot[,colnames(data.tmp)] , colour = colnames(data.tmp)),size=0.1) + 
+  geom_line(aes(y = CAViaR, colour = "CAViaR"), size=0.3) +
+    labs(x = "Date.",y="Log-return.")+
+  labs(color='Time Series') + scale_color_manual(values=c("gray20", "gray70")) + theme_bw()
+ggsave("linearTGARCHmuValidation.pdf")
+```
+
+The next step is peform the goodness-of-fit of the proposed model. We start calculating the number of HITS for each time series, i.e., for the training dataframe we have `r mean(train < CAViaR.train)` and for the validation dataframe we have `r mean(valid < CAViaR.valid)`.
+
+Since those are estimates we need a measure of variability for those HITS. We can use the stationary bootstrap to calculate the Mean Squared Error (MSE) for those estimates. We begin with the bootstrap resample for the training dataset:
+
+```{r}
+#Set seed
+set.seed(8795)
+B <- 5000
+serieBoot<-tsbootstrap(train, nb = B, type = "stationary") 
+
+#Calculate the HITS for each time series
+hits<-data.frame("VaR"=rep(NA,B))
+for(b in 1:B){
+    #Bootstrap CAViaR
+    CAViaR_boot <- linearTGARCHmuForecast(betas=betas,data=serieBoot[,b])
+    #Hits
+    hits[b,"VaR"] <- mean(serieBoot[, b] < CAViaR_boot)
+}
+hits.temp<-data.frame("Model"="linearTGARCHmu","Mean.Hits"=mean(hits[,"VaR"],na.rm = T),"Var.Hits"=var(hits[,"VaR"],na.rm = T))
+hits.train<-rbind(hits.train,hits.temp)
+```
+
+We can do the same for the validation dataframe:
+
+```{r}
+#Set seed
+set.seed(9627)
+B <- 5000
+serieBoot<-tsbootstrap(valid, nb = B, type = "stationary") 
+
+#Calculate the HITS for each time series
+hits<-data.frame("VaR"=rep(NA,B))
+for(b in 1:B){
+    #Bootstrap CAViaR
+    CAViaR_boot <- linearTGARCHmuForecast(betas=betas,data=serieBoot[,b])
+    #Hits
+    hits[b,"VaR"] <- mean(serieBoot[, b] < CAViaR_boot)
+}
+hits.temp<-data.frame("Model"="linearTGARCHmu","Mean.Hits"=mean(hits[,"VaR"],na.rm = T),"Var.Hits"=var(hits[,"VaR"],na.rm = T))
+hits.valid<-rbind(hits.valid,hits.temp)
+```
+
+###TCAV Model.
+We can start using the TCAV Model, here we define $Z_{t}=Y_{t}$, also $\gamma=0.05$:
+
+```{r,message=FALSE, warning=FALSE}
+#Z vector
+trainZ<-train
+gamma<-0.05
+#Number of parameters
+nparms<- 6
+res <- DEoptim(TCAV,lower=rep(-10,nparms),
+               upper=rep(+10,nparms),control=list(trace=FALSE))
+betas <- res$optim$bestmem
+```
+
+Now we can do the forecast:
+
+```{r,message=FALSE, warning=FALSE}
+#CAViaR train
+CAViaR.train<-TCAVForecast(betas=betas,data=train, dataZ=train)
+CAViaR.train[is.infinite(CAViaR.train)| which(CAViaR.train< -(1e+10))]<- -1
+#CAViaR valid
+CAViaR.valid<-TCAVForecast(betas=betas,data=valid, dataZ=valid)
+CAViaR.valid[is.infinite(CAViaR.valid)|which(CAViaR.valid< -(1e+10))]<- -1
+```
+
+We can visualize the CAViaR prediction for the training :
+
+```{r}
+#Create the dataPlot
+dataPlot<-as.data.frame(cbind(train,CAViaR.train))
+dataPlot$Date<-index[1:seq1,1]
+colnames(dataPlot)<-c(colnames(data.tmp),'CAViaR','Date')
+#Plot the time series
+ggplot(dataPlot, aes(Date)) + 
+  geom_line(aes(y = dataPlot[,colnames(data.tmp)] , colour = colnames(data.tmp)),size=0.1) + 
+  geom_line(aes(y = CAViaR, colour = "CAViaR"), size=0.3) +
+  labs(x = "Date.",y="Log-return.")+
+  labs(color='Time Series') + scale_color_manual(values=c("gray20", "gray70")) + theme_bw()
+ggsave("TCAVTraining.pdf")
+```
+We can visualize the CAViaR prediction for the validation :
+
+```{r}
+#Create the dataPlot
+dataPlot<-as.data.frame(cbind(valid,CAViaR.valid))
+dataPlot$Date<-index[(seq1+1):nrow(data.tmp),1]
+colnames(dataPlot)<-c(colnames(data.tmp),'CAViaR','Date')
+#Plot the time series
+ggplot(dataPlot, aes(Date)) + 
+  geom_line(aes(y = dataPlot[,colnames(data.tmp)] , colour = colnames(data.tmp)),size=0.1) + 
+  geom_line(aes(y = CAViaR, colour = "CAViaR"), size=0.3) +
+    labs(x = "Date.",y="Log-return.")+
+  labs(color='Time Series') + scale_color_manual(values=c("gray20", "gray70")) + theme_bw()
+ggsave("TCAVValidation.pdf")
+```
+
+The next step is peform the goodness-of-fit of the proposed model. We start calculating the number of HITS for each time series, i.e., for the training dataframe we have `r mean(trainRV < CAViaR.train)` and for the validation dataframe we have `r mean(validRV < CAViaR.valid)`.
+
+Since those are estimates we need a measure of variability for those HITS. We can use the stationary bootstrap to calculate the Mean Squared Error (MSE) for those estimates. We begin with the bootstrap resample for the training dataset:
+
+```{r}
+#Set seed
+set.seed(8795)
+B <- 5000
+serieBoot<-tsbootstrap(trainRV, nb = B, type = "stationary") 
+
+#Calculate the HITS for each time series
+hits<-data.frame("VaR"=rep(NA,B))
+for(b in 1:B){
+    #Bootstrap CAViaR
+    CAViaR_boot <- TCAVForecast(betas=betas,data=serieBoot[,b], dataZ = serieBoot[,b])
+    #Hits
+    hits[b,"VaR"] <- mean(serieBoot[, b] < CAViaR_boot)
+}
+hits.temp<-data.frame("Model"="TCAV","Mean.Hits"=mean(hits[,"VaR"],na.rm = T),"Var.Hits"=var(hits[,"VaR"],na.rm = T))
+hits.train<-rbind(hits.train,hits.temp)
+```
+
+We can do the same for the validation dataframe:
+
+```{r}
+#Set seed
+set.seed(9627)
+B <- 5000
+serieBoot<-tsbootstrap(valid, nb = B, type = "stationary") 
+
+#Calculate the HITS for each time series
+hits<-data.frame("VaR"=rep(NA,B))
+for(b in 1:B){
+    #Bootstrap CAViaR
+    CAViaR_boot <- TCAVForecast(betas=betas,data=serieBoot[,b], dataZ = serieBoot[,b])
+    #Hits
+    hits[b,"VaR"] <- mean(serieBoot[, b] < CAViaR_boot)
+}
+hits.temp<-data.frame("Model"="TCAV","Mean.Hits"=mean(hits[,"VaR"],na.rm = T),"Var.Hits"=var(hits[,"VaR"],na.rm = T))
+hits.valid<-rbind(hits.valid,hits.temp)
+```
+
+###rangeValue Model.
+We can start using the rangeValue Model:
+
+```{r,message=FALSE, warning=FALSE}
+#Number of parameters
+nparms<- 3
+res <- DEoptim(rangeValue,lower=rep(-10,nparms),
+               upper=rep(+10,nparms),control=list(trace=FALSE))
+betas <- res$optim$bestmem
+```
+
+Now we can do the forecast:
+
+```{r,message=FALSE, warning=FALSE}
+#CAViaR train
+CAViaR.train<-rangeValueForecast(betas=betas,data=trainRV)
+CAViaR.train[is.infinite(CAViaR.train)| which(CAViaR.train< -(1e+10))]<- -1
+#CAViaR valid
+CAViaR.valid<-rangeValueForecast(betas=betas,data=validRV)
+CAViaR.valid[is.infinite(CAViaR.valid)|which(CAViaR.valid< -(1e+10))]<- -1
+```
+
+We can visualize the CAViaR prediction for the training :
+
+```{r}
+#Create the dataPlot
+dataPlot<-as.data.frame(cbind(trainRV,CAViaR.train))
+dataPlot$Date<-index[1:seq1,1]
+colnames(dataPlot)<-c(colnames(data.tmp),'CAViaR','Date')
+#Plot the time series
+ggplot(dataPlot, aes(Date)) + 
+  geom_line(aes(y = dataPlot[,colnames(data.tmp)] , colour = colnames(data.tmp)),size=0.1) + 
+  geom_line(aes(y = CAViaR, colour = "CAViaR"), size=0.3) +
+  labs(x = "Date.",y="Log-return.")+
+  labs(color='Time Series') + scale_color_manual(values=c("gray20", "gray70")) + theme_bw()
+ggsave("rangeValueTraining.pdf")
+```
+We can visualize the CAViaR prediction for the validation :
+
+```{r}
+#Create the dataPlot
+dataPlot<-as.data.frame(cbind(validRV,CAViaR.valid))
+dataPlot$Date<-index[(seq1+1):nrow(data.tmp),1]
+colnames(dataPlot)<-c(colnames(data.tmp),'CAViaR','Date')
+#Plot the time series
+ggplot(dataPlot, aes(Date)) + 
+  geom_line(aes(y = dataPlot[,colnames(data.tmp)] , colour = colnames(data.tmp)),size=0.1) + 
+  geom_line(aes(y = CAViaR, colour = "CAViaR"), size=0.3) +
+    labs(x = "Date.",y="Log-return.")+
+  labs(color='Time Series') + scale_color_manual(values=c("gray20", "gray70")) + theme_bw()
+ggsave("rangeValueValidation.pdf")
+```
+
+The next step is peform the goodness-of-fit of the proposed model. We start calculating the number of HITS for each time series, i.e., for the training dataframe we have `r mean(trainRV < CAViaR.train)` and for the validation dataframe we have `r mean(validRV < CAViaR.valid)`.
+
+Since those are estimates we need a measure of variability for those HITS. We can use the stationary bootstrap to calculate the Mean Squared Error (MSE) for those estimates. We begin with the bootstrap resample for the training dataset:
+
+```{r}
+#Set seed
+set.seed(8795)
+B <- 5000
+serieBoot<-tsbootstrap(trainRV, nb = B, type = "stationary") 
+
+#Calculate the HITS for each time series
+hits<-data.frame("VaR"=rep(NA,B))
+for(b in 1:B){
+    #Bootstrap CAViaR
+    CAViaR_boot <- rangeValueForecast(betas=betas,data=serieBoot[,b])
+    #Hits
+    hits[b,"VaR"] <- mean(serieBoot[, b] < CAViaR_boot)
+}
+hits.temp<-data.frame("Model"="rangeValue","Mean.Hits"=mean(hits[,"VaR"],na.rm = T),"Var.Hits"=var(hits[,"VaR"],na.rm = T))
+hits.train<-rbind(hits.train,hits.temp)
+```
+
+We can do the same for the validation dataframe:
+
+```{r}
+#Set seed
+set.seed(9627)
+B <- 5000
+serieBoot<-tsbootstrap(validRV, nb = B, type = "stationary") 
+
+#Calculate the HITS for each time series
+hits<-data.frame("VaR"=rep(NA,B))
+for(b in 1:B){
+    #Bootstrap CAViaR
+    CAViaR_boot <- rangeValueForecast(betas=betas,data=serieBoot[,b])
+    #Hits
+    hits[b,"VaR"] <- mean(serieBoot[, b] < CAViaR_boot)
+}
+hits.temp<-data.frame("Model"="rangeValue","Mean.Hits"=mean(hits[,"VaR"],na.rm = T),"Var.Hits"=var(hits[,"VaR"],na.rm = T))
+hits.valid<-rbind(hits.valid,hits.temp)
+```
+
+###trigGARCH Model.
+We can start using the trigGARCH Model:
+
+```{r,message=FALSE, warning=FALSE}
+#Number of parameters
+gamma<-0.05
+nparms<- 6
+res <- DEoptim(trigGARCH,lower=rep(-10,nparms),
+               upper=rep(+10,nparms),control=list(trace=FALSE))
+betas <- res$optim$bestmem
+```
+
+Now we can do the forecast:
+
+```{r,message=FALSE, warning=FALSE}
+#CAViaR train
+CAViaR.train<-trigGARCHForecast(betas=betas,data=trainRV)
+CAViaR.train[is.infinite(CAViaR.train)| which(CAViaR.train< -(1e+10))]<- -1
+#CAViaR valid
+CAViaR.valid<-trigGARCHForecast(betas=betas,data=validRV)
+CAViaR.valid[is.infinite(CAViaR.valid)|which(CAViaR.valid< -(1e+10))]<- -1
+```
+
+We can visualize the CAViaR prediction for the training :
+
+```{r}
+#Create the dataPlot
+dataPlot<-as.data.frame(cbind(trainRV,CAViaR.train))
+dataPlot$Date<-index[1:seq1,1]
+colnames(dataPlot)<-c(colnames(data.tmp),'CAViaR','Date')
+#Plot the time series
+ggplot(dataPlot, aes(Date)) + 
+  geom_line(aes(y = dataPlot[,colnames(data.tmp)] , colour = colnames(data.tmp)),size=0.1) + 
+  geom_line(aes(y = CAViaR, colour = "CAViaR"), size=0.3) +
+  labs(x = "Date.",y="Log-return.")+
+  labs(color='Time Series') + scale_color_manual(values=c("gray20", "gray70")) + theme_bw()
+ggsave("trigGARCHTraining.pdf")
+```
+We can visualize the CAViaR prediction for the validation :
+
+```{r}
+#Create the dataPlot
+dataPlot<-as.data.frame(cbind(validRV,CAViaR.valid))
+dataPlot$Date<-index[(seq1+1):nrow(data.tmp),1]
+colnames(dataPlot)<-c(colnames(data.tmp),'CAViaR','Date')
+#Plot the time series
+ggplot(dataPlot, aes(Date)) + 
+  geom_line(aes(y = dataPlot[,colnames(data.tmp)] , colour = colnames(data.tmp)),size=0.1) + 
+  geom_line(aes(y = CAViaR, colour = "CAViaR"), size=0.3) +
+    labs(x = "Date.",y="Log-return.")+
+  labs(color='Time Series') + scale_color_manual(values=c("gray20", "gray70")) + theme_bw()
+ggsave("trigGARCHValidation.pdf")
+```
+
+The next step is peform the goodness-of-fit of the proposed model. We start calculating the number of HITS for each time series, i.e., for the training dataframe we have `r mean(trainRV < CAViaR.train)` and for the validation dataframe we have `r mean(validRV < CAViaR.valid)`.
+
+Since those are estimates we need a measure of variability for those HITS. We can use the stationary bootstrap to calculate the Mean Squared Error (MSE) for those estimates. We begin with the bootstrap resample for the training dataset:
+
+```{r}
+#Set seed
+set.seed(8795)
+B <- 5000
+serieBoot<-tsbootstrap(trainRV, nb = B, type = "stationary") 
+
+#Calculate the HITS for each time series
+hits<-data.frame("VaR"=rep(NA,B))
+for(b in 1:B){
+    #Bootstrap CAViaR
+    CAViaR_boot <- trigGARCHForecast(betas=betas,data=serieBoot[,b])
+    #Hits
+    hits[b,"VaR"] <- mean(serieBoot[, b] < CAViaR_boot)
+}
+hits.temp<-data.frame("Model"="trigGARCH","Mean.Hits"=mean(hits[,"VaR"],na.rm = T),"Var.Hits"=var(hits[,"VaR"],na.rm = T))
+hits.train<-rbind(hits.train,hits.temp)
+```
+
+We can do the same for the validation dataframe:
+
+```{r}
+#Set seed
+set.seed(9627)
+B <- 5000
+serieBoot<-tsbootstrap(validRV, nb = B, type = "stationary") 
+
+#Calculate the HITS for each time series
+hits<-data.frame("VaR"=rep(NA,B))
+for(b in 1:B){
+    #Bootstrap CAViaR
+    CAViaR_boot <- trigGARCHForecast(betas=betas,data=serieBoot[,b])
+    #Hits
+    hits[b,"VaR"] <- mean(serieBoot[, b] < CAViaR_boot)
+}
+hits.temp<-data.frame("Model"="trigGARCH","Mean.Hits"=mean(hits[,"VaR"],na.rm = T),"Var.Hits"=var(hits[,"VaR"],na.rm = T))
+hits.valid<-rbind(hits.valid,hits.temp)
+```
+
+###trvGARCH Model.
+We can start using the trvGARCH Model:
+
+```{r,message=FALSE, warning=FALSE}
+#Number of parameters
+gamma<-0.05
+nparms<- 6
+res <- DEoptim(trvGARCH,lower=rep(-10,nparms),
+               upper=rep(+10,nparms),control=list(trace=FALSE))
+betas <- res$optim$bestmem
+```
+
+Now we can do the forecast:
+
+```{r,message=FALSE, warning=FALSE}
+#CAViaR train
+CAViaR.train<-trvGARCHForecast(betas=betas,data=trainRV)
+CAViaR.train[is.infinite(CAViaR.train)| which(CAViaR.train< -(1e+10))]<- -1
+#CAViaR valid
+CAViaR.valid<-trvGARCHForecast(betas=betas,data=validRV)
+CAViaR.valid[is.infinite(CAViaR.valid)|which(CAViaR.valid< -(1e+10))]<- -1
+```
+
+We can visualize the CAViaR prediction for the training :
+
+```{r}
+#Create the dataPlot
+dataPlot<-as.data.frame(cbind(trainRV,CAViaR.train))
+dataPlot$Date<-index[1:seq1,1]
+colnames(dataPlot)<-c(colnames(data.tmp),'CAViaR','Date')
+#Plot the time series
+ggplot(dataPlot, aes(Date)) + 
+  geom_line(aes(y = dataPlot[,colnames(data.tmp)] , colour = colnames(data.tmp)),size=0.1) + 
+  geom_line(aes(y = CAViaR, colour = "CAViaR"), size=0.3) +
+  labs(x = "Date.",y="Log-return.")+
+  labs(color='Time Series') + scale_color_manual(values=c("gray20", "gray70")) + theme_bw()
+ggsave("trvGARCHTraining.pdf")
+```
+We can visualize the CAViaR prediction for the validation :
+
+```{r}
+#Create the dataPlot
+dataPlot<-as.data.frame(cbind(validRV,CAViaR.valid))
+dataPlot$Date<-index[(seq1+1):nrow(data.tmp),1]
+colnames(dataPlot)<-c(colnames(data.tmp),'CAViaR','Date')
+#Plot the time series
+ggplot(dataPlot, aes(Date)) + 
+  geom_line(aes(y = dataPlot[,colnames(data.tmp)] , colour = colnames(data.tmp)),size=0.1) + 
+  geom_line(aes(y = CAViaR, colour = "CAViaR"), size=0.3) +
+    labs(x = "Date.",y="Log-return.")+
+  labs(color='Time Series') + scale_color_manual(values=c("gray20", "gray70")) + theme_bw()
+ggsave("trvGARCHValidation.pdf")
+```
+
+The next step is peform the goodness-of-fit of the proposed model. We start calculating the number of HITS for each time series, i.e., for the training dataframe we have `r mean(trainRV < CAViaR.train)` and for the validation dataframe we have `r mean(validRV < CAViaR.valid)`.
+
+Since those are estimates we need a measure of variability for those HITS. We can use the stationary bootstrap to calculate the Mean Squared Error (MSE) for those estimates. We begin with the bootstrap resample for the training dataset:
+
+```{r}
+#Set seed
+set.seed(8795)
+B <- 5000
+serieBoot<-tsbootstrap(trainRV, nb = B, type = "stationary") 
+
+#Calculate the HITS for each time series
+hits<-data.frame("VaR"=rep(NA,B))
+for(b in 1:B){
+    #Bootstrap CAViaR
+    CAViaR_boot <- trvGARCHForecast(betas=betas,data=serieBoot[,b])
+    #Hits
+    hits[b,"VaR"] <- mean(serieBoot[, b] < CAViaR_boot)
+}
+hits.temp<-data.frame("Model"="trvGARCH","Mean.Hits"=mean(hits[,"VaR"],na.rm = T),"Var.Hits"=var(hits[,"VaR"],na.rm = T))
+hits.train<-rbind(hits.train,hits.temp)
+```
+
+We can do the same for the validation dataframe:
+
+```{r}
+#Set seed
+set.seed(9627)
+B <- 5000
+serieBoot<-tsbootstrap(validRV, nb = B, type = "stationary") 
+
+#Calculate the HITS for each time series
+hits<-data.frame("VaR"=rep(NA,B))
+for(b in 1:B){
+    #Bootstrap CAViaR
+    CAViaR_boot <- trvGARCHForecast(betas=betas,data=serieBoot[,b])
+    #Hits
+    hits[b,"VaR"] <- mean(serieBoot[, b] < CAViaR_boot)
+}
+hits.temp<-data.frame("Model"="trvGARCH","Mean.Hits"=mean(hits[,"VaR"],na.rm = T),"Var.Hits"=var(hits[,"VaR"],na.rm = T))
+hits.valid<-rbind(hits.valid,hits.temp)
+```
+
+##Results.
+Finally we have the follow results for the training dataset:
+
+```{r}
+kable(hits.train, caption = "Training Results.")
+```
+
+and for the validation dataframe:
+
+```{r}
+kable(hits.valid, caption = "Validation Results.")
+```
